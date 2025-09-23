@@ -17,6 +17,7 @@ The DONOR protocol creates a secure, transparent marketplace for health data sha
 - 💾 **Data Donation**: Secure submission of anonymized health data with hash verification
 - 🎁 **Token Rewards**: Automatic STX rewards for valid data contributions
 - 🔐 **Access Control**: Permission-based data access with expiration
+- 🚀 **Off-chain Permits**: Gasless delegated consent via cryptographic signatures
 - 📊 **Analytics**: Comprehensive stats tracking for all participants
 
 ## 🚀 Getting Started
@@ -60,6 +61,29 @@ The DONOR protocol creates a secure, transparent marketplace for health data sha
 3. **Access Data**
    ```clarity
    (contract-call? .donor access-data u1) ;; returns data hash
+   ```
+
+### For Off-chain Permits 🚀
+
+1. **Generate Permit Message** (donor signs off-chain)
+   ```clarity
+   (contract-call? .donor build-permit-message 
+     u1                        ;; donation ID
+     'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7 ;; researcher
+     u150000                   ;; expiry block
+     tx-sender)                ;; donor address
+   ```
+
+2. **Redeem Permit** (anyone can call)
+   ```clarity
+   (contract-call? .donor redeem-permit
+     u1                        ;; donation ID
+     'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7 ;; researcher
+     u150000                   ;; expiry block
+     u0                        ;; nonce
+     { r: 0x..., s: 0x... }    ;; signature
+     0x...                     ;; donor public key
+     'SP1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE) ;; donor address
    ```
 
 ## 💰 Economics
@@ -154,3 +178,30 @@ This project is licensed under the MIT License.
 ---
 
 Made with ❤️ for advancing medical research through decentralized data sharing
+
+## 🎁 Off-chain Permit System
+
+The permit system allows donors to grant data access through cryptographic signatures without on-chain transactions, enabling gasless consent workflows.
+
+### How It Works
+
+1. **Donor signs off-chain**: Generate a permit message and sign with private key
+2. **Anyone can redeem**: Submit the signature on-chain to grant access
+3. **One-time use**: Each permit can only be redeemed once using nonces
+4. **Time-bound**: Permits expire at specified block heights
+
+### Permit Functions
+
+- `redeem-permit`: Redeem signed permit to grant researcher access
+- `grant-permit-access`: Direct permit grant by donor (on-chain)
+- `build-permit-message`: Get message hash for off-chain signing
+- `get-permit-nonce`: Get current nonce for donor
+- `is-permit-used`: Check permit redemption status
+
+### Permit Error Codes
+
+- `u200`: Invalid cryptographic signature
+- `u201`: Permit expired
+- `u202`: Permit already used
+- `u203`: Donor not registered
+- `u204`: Invalid nonce or unauthorized

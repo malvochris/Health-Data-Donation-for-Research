@@ -12,6 +12,9 @@
 (define-constant ERR-INVALID-DATA (err u104))
 (define-constant ERR-ACCESS-DENIED (err u105))
 (define-constant ERR-EXPIRED (err u106))
+(define-constant ERR-INVALID-SIGNATURE (err u200))
+(define-constant ERR-PERMIT-EXPIRED (err u201))
+(define-constant ERR-PERMIT-USED (err u202))
 
 (define-constant REWARD-PER-DONATION u1000000)
 (define-constant MIN-STAKE-RESEARCHER u5000000)
@@ -58,6 +61,10 @@
 })
 
 (define-map data-access-permissions { researcher: principal, donation-id: uint } bool)
+
+(define-map used-permits (buff 32) bool)
+
+(define-map permit-nonces principal uint)
 
 ;; public functions
 
@@ -229,6 +236,58 @@
   )
 )
 
+(define-public (redeem-permit 
+  (donation-id uint) 
+  (researcher principal) 
+  (expiry uint) 
+  (nonce uint)
+  (signature { r: (buff 32), s: (buff 32) })
+  (donor-public-key (buff 33))
+  (donor-address principal)
+)
+  (let (
+    (permit-hash (build-permit-hash donation-id researcher expiry nonce))
+    (current-height stacks-block-height)
+  )
+    (asserts! (>= expiry current-height) ERR-PERMIT-EXPIRED)
+    (asserts! (is-none (map-get? used-permits permit-hash)) ERR-PERMIT-USED)
+    
+    (asserts! (verify-permit-signature permit-hash signature donor-public-key) ERR-INVALID-SIGNATURE)
+    (asserts! (is-some (map-get? donors donor-address)) ERR-NOT-FOUND)
+    (asserts! (is-eq nonce (default-to u0 (map-get? permit-nonces donor-address))) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? researchers researcher)) ERR-NOT-FOUND)
+    (asserts! (get is-verified (unwrap-panic (map-get? researchers researcher))) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? data-donations donation-id)) ERR-NOT-FOUND)
+    
+    (let ((donation (unwrap-panic (map-get? data-donations donation-id))))
+      (asserts! (is-eq (get donor donation) donor-address) ERR-NOT-AUTHORIZED)
+      (asserts! (< (- stacks-block-height (get submitted-at donation)) DATA-EXPIRY-BLOCKS) ERR-EXPIRED)
+      
+      (map-set used-permits permit-hash true)
+      (increment-nonce donor-address)
+      (map-set data-access-permissions { researcher: researcher, donation-id: donation-id } true)
+      (ok true)
+    )
+  )
+)
+
+(define-public (grant-permit-access (donation-id uint) (researcher principal))
+  (let ((caller tx-sender))
+    (asserts! (is-some (map-get? donors caller)) ERR-NOT-FOUND)
+    (asserts! (is-some (map-get? researchers researcher)) ERR-NOT-FOUND)
+    (asserts! (get is-verified (unwrap-panic (map-get? researchers researcher))) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? data-donations donation-id)) ERR-NOT-FOUND)
+    
+    (let ((donation (unwrap-panic (map-get? data-donations donation-id))))
+      (asserts! (is-eq (get donor donation) caller) ERR-NOT-AUTHORIZED)
+      (asserts! (< (- stacks-block-height (get submitted-at donation)) DATA-EXPIRY-BLOCKS) ERR-EXPIRED)
+      
+      (map-set data-access-permissions { researcher: researcher, donation-id: donation-id } true)
+      (ok true)
+    )
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-donor-info (donor principal))
@@ -285,8 +344,48 @@
   )
 )
 
+(define-read-only (get-permit-nonce (donor principal))
+  (default-to u0 (map-get? permit-nonces donor))
+)
+
+(define-read-only (is-permit-used (permit-hash (buff 32)))
+  (default-to false (map-get? used-permits permit-hash))
+)
+
+(define-read-only (build-permit-message 
+  (donation-id uint) 
+  (researcher principal) 
+  (expiry uint) 
+  (donor principal)
+)
+  (build-permit-hash donation-id researcher expiry (get-permit-nonce donor))
+)
+
 ;; private functions
 
 (define-private (is-data-expired (submitted-at uint))
   (> (- stacks-block-height submitted-at) DATA-EXPIRY-BLOCKS)
+)
+
+(define-private (increment-nonce (donor principal))
+  (let ((current-nonce (default-to u0 (map-get? permit-nonces donor))))
+    (map-set permit-nonces donor (+ current-nonce u1))
+    (+ current-nonce u1)
+  )
+)
+
+(define-private (build-permit-hash (donation-id uint) (researcher principal) (expiry uint) (nonce uint))
+  (let (
+    (donation-id-buff (unwrap-panic (to-consensus-buff? donation-id)))
+    (researcher-buff (unwrap-panic (to-consensus-buff? researcher)))
+    (expiry-buff (unwrap-panic (to-consensus-buff? expiry)))
+    (nonce-buff (unwrap-panic (to-consensus-buff? nonce)))
+    (contract-buff (unwrap-panic (to-consensus-buff? (as-contract tx-sender))))
+  )
+    (sha256 (concat donation-id-buff (concat researcher-buff (concat expiry-buff (concat nonce-buff contract-buff)))))
+  )
+)
+
+(define-private (verify-permit-signature (message-hash (buff 32)) (signature { r: (buff 32), s: (buff 32) }) (public-key (buff 33)))
+  (secp256k1-verify message-hash (concat (get r signature) (get s signature)) public-key)
 )
