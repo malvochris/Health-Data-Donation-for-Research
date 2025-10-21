@@ -15,6 +15,9 @@
 (define-constant ERR-INVALID-SIGNATURE (err u200))
 (define-constant ERR-PERMIT-EXPIRED (err u201))
 (define-constant ERR-PERMIT-USED (err u202))
+(define-constant ERR-INVALID-RATING (err u207))
+(define-constant ERR-ALREADY-RATED (err u208))
+(define-constant ERR-NOT-ACCESSED (err u209))
 
 (define-constant REWARD-PER-DONATION u1000000)
 (define-constant MIN-STAKE-RESEARCHER u5000000)
@@ -65,6 +68,23 @@
 (define-map used-permits (buff 32) bool)
 
 (define-map permit-nonces principal uint)
+
+(define-map donation-ratings { donation-id: uint, researcher: principal } {
+  rating: uint,
+  rated-at: uint
+})
+
+(define-map donor-rating-history principal {
+  total-rating-points: uint,
+  rating-count: uint
+})
+
+(define-map reward-multipliers principal {
+  multiplier: uint,
+  last-updated: uint
+})
+
+(define-map researcher-donations-accessed { researcher: principal, donation-id: uint } bool)
 
 ;; public functions
 
@@ -119,31 +139,33 @@
   (let (
     (caller tx-sender)
     (donation-id (+ (var-get total-donations) u1))
-    (reward-amount REWARD-PER-DONATION)
+    (base-reward REWARD-PER-DONATION)
+    (multiplier (get-reward-multiplier caller))
+    (final-reward (/ (* base-reward multiplier) u100))
   )
     (asserts! (is-some (map-get? donors caller)) ERR-NOT-FOUND)
     (asserts! (> (len data-hash) u0) ERR-INVALID-DATA)
-    (asserts! (>= (var-get contract-balance) reward-amount) ERR-INSUFFICIENT-FUNDS)
+    (asserts! (>= (var-get contract-balance) final-reward) ERR-INSUFFICIENT-FUNDS)
     
     (map-set data-donations donation-id {
       donor: caller,
       data-hash: data-hash,
       data-type: data-type,
       submitted-at: stacks-block-height,
-      reward-amount: reward-amount,
+      reward-amount: final-reward,
       is-anonymous: is-anonymous,
       access-count: u0
     })
     
-    (try! (as-contract (stx-transfer? reward-amount tx-sender caller)))
+    (try! (as-contract (stx-transfer? final-reward tx-sender caller)))
     
     (map-set donors caller
       (merge (unwrap-panic (map-get? donors caller))
              { total-donations: (+ (get total-donations (unwrap-panic (map-get? donors caller))) u1),
-               total-rewards: (+ (get total-rewards (unwrap-panic (map-get? donors caller))) reward-amount) }))
+               total-rewards: (+ (get total-rewards (unwrap-panic (map-get? donors caller))) final-reward) }))
     
     (var-set total-donations donation-id)
-    (var-set contract-balance (- (var-get contract-balance) reward-amount))
+    (var-set contract-balance (- (var-get contract-balance) final-reward))
     (ok donation-id)
   )
 )
@@ -185,6 +207,8 @@
       (map-set researchers caller
         (merge (unwrap-panic (map-get? researchers caller))
                { total-accessed: (+ (get total-accessed (unwrap-panic (map-get? researchers caller))) u1) }))
+      
+      (map-set researcher-donations-accessed { researcher: caller, donation-id: donation-id } true)
       
       (ok (get data-hash (unwrap-panic (map-get? data-donations donation-id))))
     )
@@ -236,7 +260,36 @@
   )
 )
 
-(define-public (redeem-permit 
+(define-public (rate-donation (donation-id uint) (rating uint))
+  (let ((caller tx-sender))
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+    (asserts! (is-some (map-get? researchers caller)) ERR-NOT-FOUND)
+    (asserts! (get is-verified (unwrap-panic (map-get? researchers caller))) ERR-NOT-AUTHORIZED)
+    (asserts! (default-to false (map-get? researcher-donations-accessed { researcher: caller, donation-id: donation-id })) ERR-NOT-ACCESSED)
+    (asserts! (is-none (map-get? donation-ratings { donation-id: donation-id, researcher: caller })) ERR-ALREADY-RATED)
+    (asserts! (is-some (map-get? data-donations donation-id)) ERR-NOT-FOUND)
+    
+    (let ((donation (unwrap-panic (map-get? data-donations donation-id)))
+          (donor (get donor donation)))
+      (map-set donation-ratings { donation-id: donation-id, researcher: caller } {
+        rating: rating,
+        rated-at: stacks-block-height
+      })
+      
+      (let ((history (default-to { total-rating-points: u0, rating-count: u0 } (map-get? donor-rating-history donor))))
+        (map-set donor-rating-history donor {
+          total-rating-points: (+ (get total-rating-points history) rating),
+          rating-count: (+ (get rating-count history) u1)
+        })
+      )
+      
+      (map-delete reward-multipliers donor)
+      (ok true)
+    )
+  )
+)
+
+(define-public (redeem-permit
   (donation-id uint) 
   (researcher principal) 
   (expiry uint) 
@@ -361,6 +414,27 @@
   (build-permit-hash donation-id researcher expiry (get-permit-nonce donor))
 )
 
+(define-read-only (get-donation-rating (donation-id uint) (researcher principal))
+  (map-get? donation-ratings { donation-id: donation-id, researcher: researcher })
+)
+
+(define-read-only (get-donor-average-rating (donor principal))
+  (match (map-get? donor-rating-history donor)
+    history (ok (if (> (get rating-count history) u0)
+                    (/ (* (get total-rating-points history) u100) (get rating-count history))
+                    u300))
+    (ok u300)
+  )
+)
+
+(define-read-only (get-donor-rating-stats (donor principal))
+  (map-get? donor-rating-history donor)
+)
+
+(define-public (get-current-multiplier (donor principal))
+  (ok (get-reward-multiplier donor))
+)
+
 ;; private functions
 
 (define-private (is-data-expired (submitted-at uint))
@@ -388,4 +462,32 @@
 
 (define-private (verify-permit-signature (message-hash (buff 32)) (signature { r: (buff 32), s: (buff 32) }) (public-key (buff 33)))
   (secp256k1-verify message-hash (concat (get r signature) (get s signature)) public-key)
+)
+
+(define-private (calculate-average-rating (donor principal))
+  (match (map-get? donor-rating-history donor)
+    history (if (> (get rating-count history) u0)
+                (/ (* (get total-rating-points history) u100) (get rating-count history))
+                u300)
+    u300
+  )
+)
+
+(define-private (get-reward-multiplier (donor principal))
+  (let ((cached (map-get? reward-multipliers donor))
+        (avg-rating (calculate-average-rating donor)))
+    (if (is-some cached)
+      (get multiplier (unwrap-panic cached))
+      (let ((multiplier (if (>= avg-rating u500) u150
+              (if (>= avg-rating u400) u130
+                (if (>= avg-rating u300) u110
+                  (if (>= avg-rating u200) u100 u90))))))
+        (map-set reward-multipliers donor {
+          multiplier: multiplier,
+          last-updated: stacks-block-height
+        })
+        multiplier
+      )
+    )
+  )
 )
